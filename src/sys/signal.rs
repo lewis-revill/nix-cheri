@@ -670,15 +670,37 @@ impl SigAction {
     /// is the `SigAction` variant). `mask` specifies other signals to block during execution of
     /// the signal-catching function.
     pub fn new(handler: SigHandler, flags: SaFlags, mask: SigSet) -> SigAction {
-        unsafe fn install_sig(p: *mut libc::sigaction, handler: SigHandler) {
-            (*p).sa_sigaction = match handler {
-                SigHandler::SigDfl => libc::SIG_DFL,
-                SigHandler::SigIgn => libc::SIG_IGN,
-                SigHandler::Handler(f) => f as *const extern fn(libc::c_int) as usize,
-                #[cfg(not(target_os = "redox"))]
-                SigHandler::SigAction(f) => f as *const extern fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as usize,
-            };
+cfg_if::cfg_if! {
+        if #[cfg(all(target_arch = "morello+c64"))] {
+            unsafe fn install_sig(p: *mut libc::sigaction, handler: SigHandler) {
+                match handler {
+                    SigHandler::SigDfl => (*p).sa_u.sa_handler.sah_id = libc::SIG_DFL,
+                    SigHandler::SigIgn => (*p).sa_u.sa_handler.sah_id = libc::SIG_IGN,
+                    SigHandler::Handler(f) => (*p).sa_u.sa_handler.sah_fn = f,
+                    SigHandler::SigAction(f) => (*p).sa_u.sa_sigaction = f,
+                };
+            }
+        } else if #[cfg(target_os = "aix")] {
+            unsafe fn install_sig(p: *mut libc::sigaction, handler: SigHandler) {
+                (*p).sa_union.__su_sigaction = match handler {
+                    SigHandler::SigDfl => mem::transmute::<usize, extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)>(libc::SIG_DFL),
+                    SigHandler::SigIgn => mem::transmute::<usize, extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)>(libc::SIG_IGN),
+                    SigHandler::Handler(f) => mem::transmute::<extern "C" fn(i32), extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void)>(f),
+                    SigHandler::SigAction(f) => f,
+                };
+            }
+        } else {
+            unsafe fn install_sig(p: *mut libc::sigaction, handler: SigHandler) {
+                (*p).sa_sigaction = match handler {
+                    SigHandler::SigDfl => libc::SIG_DFL,
+                    SigHandler::SigIgn => libc::SIG_IGN,
+                    SigHandler::Handler(f) => f as *const extern fn(libc::c_int) as usize,
+                    #[cfg(not(target_os = "redox"))]
+                    SigHandler::SigAction(f) => f as *const extern fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as usize,
+                };
+            }
         }
+}
 
         let mut s = mem::MaybeUninit::<libc::sigaction>::uninit();
         unsafe {
@@ -706,6 +728,37 @@ impl SigAction {
         SigSet { sigset: self.sigaction.sa_mask }
     }
 
+cfg_if::cfg_if! {
+    if #[cfg(all(target_arch = "morello+c64", target_env = "musl"))] {
+    pub fn handler(&self) -> SigHandler {
+        match self.sigaction.sa_u.sa_handler.sah_id {
+            libc::SIG_DFL => return SigHandler::SigDfl,
+            libc::SIG_IGN => return SigHandler::SigIgn,
+        };
+        if self.flags().contains(SaFlags::SA_SIGINFO) {
+            return SigHandler::SigAction(self.sigaction.sa_u.sa_sigaction);
+        }
+        SigHandler::SigAction(self.sigaction.sa_u.sa_handler.sah_fn);
+    }
+    } else if #[cfg(target_os = "aix")] {
+    pub fn handler(&self) -> SigHandler {
+        unsafe {
+        match self.sigaction.sa_union.__su_sigaction as usize {
+            libc::SIG_DFL => SigHandler::SigDfl,
+            libc::SIG_IGN => SigHandler::SigIgn,
+            p if self.flags().contains(SaFlags::SA_SIGINFO) =>
+                SigHandler::SigAction(
+                    *(&p as *const usize
+                         as *const extern fn(_, _, _))
+                as extern fn(_, _, _)),
+            p => SigHandler::Handler(
+                    *(&p as *const usize
+                         as *const extern fn(libc::c_int))
+                as extern fn(libc::c_int)),
+        }
+        }
+    }
+    } else {
     /// Returns the action's handler.
     pub fn handler(&self) -> SigHandler {
         match self.sigaction.sa_sigaction {
