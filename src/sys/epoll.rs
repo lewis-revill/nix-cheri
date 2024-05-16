@@ -52,7 +52,7 @@ impl EpollEvent {
         EpollEvent {
             event: libc::epoll_event {
                 events: events.bits() as u32,
-                u64: data,
+                u64: (data as *const u8).into(),
             },
         }
     }
@@ -66,7 +66,8 @@ impl EpollEvent {
     }
 
     pub fn data(&self) -> u64 {
-        self.event.u64
+        let ptr: *const u8 = self.event.u64.into();
+        ptr as u64
     }
 }
 
